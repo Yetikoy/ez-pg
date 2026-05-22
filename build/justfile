@@ -1,0 +1,123 @@
+set shell := ["bash", "-uc"]
+
+#TODO: export stash stuff as a module in a separate file
+#TODO: add weekly/monthly/yearly backup tracks, no WAL, keep 4/10/10, simulate logarithmic decay
+#TODO: add psql recipe, similar to bash one
+#TODO: in restore-to, add recovery_target_timeline param override
+#TODO: complain about nonempty prefetch dir, similar to stash dir
+#TODO: make restore-to automatically choose track
+#TODO: make promotion after restore not automatic, but requiring --yolo flag
+#TODO: set concurrency to number of CPUs
+#TODO: add s3 space usage calculator
+
+export AWS_ACCESS_KEY_ID := env_var("S3_ACCESS_KEY_ID")
+export AWS_SECRET_ACCESS_KEY := env_var("S3_SECRET_ACCESS_KEY")
+export AWS_ENDPOINT := env_var("S3_URL")
+export PGDATA := env_var_or_default("PGDATA", "/var/lib/postgresql/data/pgdata")
+export PGEZ_ARCHIVE_TIMEOUT_SECONDS := env_var_or_default("PGEZ_ARCHIVE_TIMEOUT_SECONDS", "60")
+export PGHOST := "/var/run/postgresql"
+export PGUSER := "postgres"
+export WALG_S3_PREFIX := "s3://" + env_var("S3_BUCKET") + "/backups_hot"
+#export WALG_UPLOAD_WAL_METADATA="BULK"
+export WALG_DOWNLOAD_CONCURRENCY := "2"
+#export WALG_PREFETCH_DIR := `dirname $PGDATA` + "/wal_prefetch"
+#export WALG_PREFETCH_DIR := "/tmp/wal_prefetch"
+#export WALG_LOG_LEVEL := "DEVEL"
+export STASH_ROOT := `dirname $PGDATA` + "/.stash"
+
+now := `date +%s`
+# '|| true' to prevent crashes. Note shell(f"") instead of `` to use vars
+latest_stash := shell(f"ls -1td {{STASH_ROOT}}/* 2>/dev/null | head -n 1 | xargs -r basename || true")
+
+_require_empty_pgdata:
+    @if [ -d "{{PGDATA}}" ] && [ "$(ls -A {{PGDATA}})" ]; then \
+        echo "{{RED + BOLD}}Error{{NORMAL}}: PGDATA is not empty. Run 'just stash' first."; \
+        exit 1; \
+    fi
+
+reset-file-permissions:
+    chown -R postgres:postgres "{{PGDATA}}"
+
+# run postgres
+run:
+    @if [ ! -d "{{PGDATA}}" ]; then mkdir "{{PGDATA}}"; chown postgres:postgres "{{PGDATA}}"; fi
+    @just stash-check
+    /usr/local/bin/docker-entrypoint.sh postgres \
+        -c wal_level=replica \
+        -c archive_mode=on \
+        -c archive_command='wal-g wal-push %p' \
+        -c archive_timeout={{PGEZ_ARCHIVE_TIMEOUT_SECONDS}}
+
+# push a full base backup
+backup:
+    @just stash-check
+    @pg_isready -q || (echo "postgres is not ready yet"; exit 1)
+    wal-g backup-push {{PGDATA}}
+
+# PITR restore: restore-to "2024-04-10 12:00:00"
+restore-to timestamp: _require_empty_pgdata
+    wal-g backup-fetch {{PGDATA}} LATEST
+    # We should prefetch WAL files but prefetcher downloads files alreagy processed https://github.com/wal-g/wal-g/issues/892 so abandoning it for now
+    touch {{PGDATA}}/recovery.signal
+    #echo "restore_command = 'just _restore-from-s3 %f %p'" > {{PGDATA}}/postgresql.auto.conf
+    echo "restore_command = 'wal-g wal-fetch %f %p'" > {{PGDATA}}/postgresql.auto.conf
+    echo "recovery_target_time = '{{timestamp}}'" >> {{PGDATA}}/postgresql.auto.conf
+    echo "recovery_target_action = 'promote'" >> {{PGDATA}}/postgresql.auto.conf
+    #echo "wal_retrieve_retry_interval = '100ms'" >> {{PGDATA}}/postgresql.auto.conf
+    @just reset-file-permissions
+    @echo "Done. Run 'just run' to start recovery."
+
+_restore-from-s3 filename destination:
+    wal-g wal-fetch {{filename}} {{destination}}
+
+# list available S3 backups
+list-s3-backups:
+    wal-g backup-list
+
+# variadic bash recipe
+bash *args:
+    exec bash {{args}}
+
+# create table for heartbeat
+heartbeat-init:
+    psql -U postgres -c "CREATE TABLE IF NOT EXISTS public.heartbeat (id int PRIMARY KEY, ts timestamptz);"
+    psql -U postgres -c "INSERT INTO public.heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO NOTHING;"
+
+heartbeat:
+    @psql -U postgres -c "UPDATE public.heartbeat SET ts = now() where id = 1;"
+
+# stash current state
+[group('stash')]
+stash name=now:
+    @mkdir -p {{STASH_ROOT}}
+    @mkdir "{{STASH_ROOT}}/{{name}}" && rmdir "{{STASH_ROOT}}/{{name}}" # ensure target dir does not exist, fail if it does
+    @mv "{{PGDATA}}" "{{STASH_ROOT}}/{{name}}"
+    @echo "Stash complete: '{{name}}'"
+
+# list stashes, newest first
+[group('stash')]
+stash-list:
+    @if [ -d "{{STASH_ROOT}}" ]; then \
+        ls -t {{STASH_ROOT}}/ 2>/dev/null ; \
+    fi
+
+# restore a stash, latest one if name omitted
+[group('stash')]
+stash-pop name=latest_stash: _require_empty_pgdata
+    @if [ -z "{{STASH_ROOT}}/{{name}}" ]; then echo "{{RED + BOLD}}Error{{NORMAL}}: Couldn't find '{{name}}' to pop."; exit 1; fi
+    @echo "Restoring stash '{{name}}'..."
+    -rmdir {{PGDATA}}
+    mv {{STASH_ROOT}}/{{name}} {{PGDATA}}
+    @echo "Unstash complete."
+
+# remove all stashes
+[group('stash')]
+stash-wipe:
+    rm -rf {{STASH_ROOT}} && echo "Wiped."
+
+# check if any pending stashes
+[group('stash')]
+stash-check:
+    @if [ -d "{{STASH_ROOT}}" ] && [ "$(ls -A {{STASH_ROOT}})" ]; then \
+        echo "{{RED + BOLD}}WARNING{{NORMAL}}: Local stashes exist. See 'just stash-list'."; \
+    fi
