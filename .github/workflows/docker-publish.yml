@@ -2,7 +2,7 @@ name: Build and Push Postgres S3 Image
 
 on:
   push:
-    branches: [ "main" ] # Triggers build on push to main branch
+    branches: [ "master" ] # Triggers build on push to main branch
       #pull_request:
       #branches: [ "main" ]
 
