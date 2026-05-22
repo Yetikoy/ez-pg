@@ -5,6 +5,7 @@ on:
     branches: [ "master" ] # Triggers build on push to main branch
       #pull_request:
       #branches: [ "main" ]
+  workflow_dispatch: # add a button for manual trigger
 
 jobs:
   build-and-push:
