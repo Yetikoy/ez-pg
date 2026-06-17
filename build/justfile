@@ -43,6 +43,7 @@ run:
     @if [ ! -d "{{PGDATA}}" ]; then mkdir "{{PGDATA}}"; chown postgres:postgres "{{PGDATA}}"; fi
     @just stash-check
     /usr/local/bin/docker-entrypoint.sh postgres \
+        -c shared_preload_libraries=$PGEZ_SHARED_PRELOAD_LIBRARIES \
         -c wal_level=replica \
         -c archive_mode=on \
         -c archive_command='wal-g wal-push %p' \
